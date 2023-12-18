@@ -1,4 +1,4 @@
-input
-.venv
-.idea
-.vscode
+.venv/
+.idea/
+.vscode/
+input/*
