@@ -72,6 +72,16 @@ selected_languages = []
 source_language = "???"
 
 
+def get_settings():
+    result = cursor.execute("SELECT key, value FROM settings").fetchall()
+    return {key: value for key, value in result}
+
+
+def set_setting(key, value):
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
+
+
 def generate_audio(line, voice):
     line_hash = hashlib.sha256(line.encode()).hexdigest()
     path = f"output/audio/{line_hash}.wav"
@@ -196,46 +206,43 @@ def do_work(lines, images):
 class MainList(QWidget):
     def __init__(self):
         super().__init__()
-        self.text_list = []
 
         self.layout = QVBoxLayout(self)
         self.setLayout(self.layout)
-
         self.setAcceptDrops(True)
+
+        self.text_list = []
 
         self.list_widget = QListWidget()
         self.list_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.list_widget.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
         self.layout.addWidget(self.list_widget)
 
-        self.editor_buttons_layout = QHBoxLayout()
-        self.layout.addLayout(self.editor_buttons_layout)
 
-        self.move_buttons_layout = QVBoxLayout()
-        self.editor_buttons_layout.addLayout(self.move_buttons_layout, 2)
+        self.buttons_layout = QHBoxLayout()
+        self.buttons_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.layout.addLayout(self.buttons_layout)
 
         self.up_button = QPushButton("Move Up")
         self.up_button.clicked.connect(self.move_up)
-        self.move_buttons_layout.addWidget(self.up_button)
+        self.buttons_layout.addWidget(self.up_button)
 
         self.down_button = QPushButton("Move Down")
         self.down_button.clicked.connect(self.move_down)
-        self.move_buttons_layout.addWidget(self.down_button)
-
-        self.util_buttons_layout = QVBoxLayout()
-        self.editor_buttons_layout.addLayout(self.util_buttons_layout, 1)
+        self.buttons_layout.addWidget(self.down_button)
 
         self.remove_button = QPushButton("Remove Item")
         self.remove_button.clicked.connect(self.remove_item)
-        self.util_buttons_layout.addWidget(self.remove_button)
+        self.buttons_layout.addWidget(self.remove_button)
 
         self.clear_button = QPushButton("Clear List")
         self.clear_button.clicked.connect(self.clear_with_confirm)
-        self.util_buttons_layout.addWidget(self.clear_button)
+        self.buttons_layout.addWidget(self.clear_button)
 
         self.done_button = QPushButton("Done")
         self.done_button.clicked.connect(self.done)
-        self.layout.addWidget(self.done_button)
+        self.done_button.setDefault(True)
+        self.buttons_layout.addWidget(self.done_button, 1)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -271,24 +278,24 @@ class MainList(QWidget):
             self.list_widget.item(i).setText(self.get_next_text())
 
     def remove_item(self):
-        for item in self.list_widget.selectedItems():
-            self.list_widget.takeItem(self.list_widget.row(item))
+        if self.list_widget.count() == 0:
+            return
+        if QMessageBox.question(self, "Confirm Remove", "Are you sure you want to remove the selected item?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self.list_widget.takeItem(self.list_widget.currentRow())
 
     def move_up(self):
-        for item in self.list_widget.selectedItems():
-            row = self.list_widget.row(item)
-            if row > 0:
-                self.list_widget.takeItem(row)
-                self.list_widget.insertItem(row - 1, item)
-                self.list_widget.setCurrentItem(item)
+        current = self.list_widget.currentRow()
+        if current > 0:
+            self.list_widget.insertItem(current - 1, self.list_widget.takeItem(current))
+            self.list_widget.setCurrentRow(current - 1)
 
     def move_down(self):
-        for item in self.list_widget.selectedItems():
-            row = self.list_widget.row(item)
-            if row < self.list_widget.count() - 1:
-                self.list_widget.takeItem(row)
-                self.list_widget.insertItem(row + 1, item)
-                self.list_widget.setCurrentItem(item)
+        current = self.list_widget.currentRow()
+        if current < self.list_widget.count() - 1:
+            self.list_widget.insertItem(current + 1, self.list_widget.takeItem(current))
+            self.list_widget.setCurrentRow(current + 1)
 
     def clear_with_confirm(self):
         if self.list_widget.count() > 0:
@@ -399,6 +406,9 @@ class SettingsWidget(QWidget):
         self.source_combo.addItems(self.source_langs)
         self.layout.addWidget(self.source_combo)
 
+        if source_language in self.source_langs:
+            self.source_combo.setCurrentText(source_language)
+
         self.target_label = QLabel("Target languages:")
         self.layout.addWidget(self.target_label)
 
@@ -414,6 +424,8 @@ class SettingsWidget(QWidget):
         self.target_langs.sort()
         for lang in self.target_langs:
             checkbox = QCheckBox(lang)
+            if selected_languages:
+                checkbox.setChecked(lang in selected_languages)
             checkbox.stateChanged.connect(self.update_targets)
             self.checkboxes.append(checkbox)
             self.scrollable_layout.addWidget(checkbox)
@@ -491,14 +503,17 @@ class SettingsWidget(QWidget):
         for checkbox in self.checkboxes:
             if checkbox.isChecked():
                 selected_languages.append(checkbox.text())
+        set_setting("selected_languages", ",".join(selected_languages))
 
     def update_source(self):
         global source_language
         source_language = self.source_combo.currentText()
+        set_setting("source_language", source_language)
 
     def update_fps(self, value):
         global fps
         fps = value
+        set_setting("fps", fps)
 
     def update_scale(self, value):
         rounded_value = value // 10 * 10
@@ -507,15 +522,18 @@ class SettingsWidget(QWidget):
         global scale
         scale = rounded_value / 100
         self.scale_label.setText(f"Scale ({scale}):")
+        set_setting("scale", scale)
 
     def update_voice(self, value):
         global voice
         voice = value
+        set_setting("voice", voice)
 
     def update_video_length(self, value):
         global video_length
         video_length = value
         self.video_length_label.setText(f"Video length ({video_length}):")
+        set_setting("video_length", video_length)
 
     def update_fade_duration(self, value):
         rounded_value = value // 25 * 25
@@ -524,6 +542,7 @@ class SettingsWidget(QWidget):
         global fade_duration
         fade_duration = rounded_value / 100
         self.fade_duration_label.setText(f"Fade duration ({fade_duration}):")
+        set_setting("fade_duration", fade_duration)
 
     def update_audio_padding(self, value):
         rounded_value = value // 250 * 250
@@ -532,6 +551,7 @@ class SettingsWidget(QWidget):
         global audio_padding
         audio_padding = rounded_value
         self.audio_padding_label.setText(f"Audio padding ({audio_padding}ms):")
+        set_setting("audio_padding", audio_padding)
 
     def show_api_keys(self):
         api_keys_window = ApiKeysWindow()
@@ -563,13 +583,13 @@ class SracreWindow(QMainWindow):
         self.editor_layout = QHBoxLayout()
         self.layout.addLayout(self.editor_layout, 3)
 
-        self.list_group = QGroupBox("Content")
-        self.list_group_layout = QVBoxLayout()
-        self.list_group.setLayout(self.list_group_layout)
-        self.editor_layout.addWidget(self.list_group, 2)
+        self.editor_group = QGroupBox("Editor")
+        self.editor_group_layout = QVBoxLayout()
+        self.editor_group.setLayout(self.editor_group_layout)
+        self.editor_layout.addWidget(self.editor_group, 2)
 
         self.list_widget = MainList()
-        self.list_group_layout.addWidget(self.list_widget)
+        self.editor_group_layout.addWidget(self.list_widget)
 
         self.language_group = QGroupBox("Settings")
         self.language_group_layout = QVBoxLayout()
@@ -603,22 +623,44 @@ class SracreWindow(QMainWindow):
 
 
 def setup_db():
-    cursor.execute("CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     cursor.execute("CREATE TABLE IF NOT EXISTS keys (api TEXT, key TEXT, quota_used INTEGER, quota_total INTEGER, "
                    "reset_time INTEGER)")
     db.commit()
 
 
-def main():
-    for directory in OUT_DIRS:
-        os.makedirs(directory, exist_ok=True)
+class SracreApp(QApplication):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    setup_db()
-    elevenlabs.set_api_key(elevenlabs_api.get_key(0).key)
-    app = QApplication(sys.argv)
-    ex = SracreWindow()
-    sys.exit(app.exec())
+        for directory in OUT_DIRS:
+            os.makedirs(directory, exist_ok=True)
+
+        setup_db()
+        elevenlabs.set_api_key(elevenlabs_api.get_key(0).key)
+
+        settings = get_settings()
+        global source_language, selected_languages, fps, scale, voice, video_length, fade_duration, audio_padding
+        if "source_language" in settings:
+            source_language = settings["source_language"]
+        if "selected_languages" in settings:
+            selected_languages = settings["selected_languages"].split(",")
+        if "fps" in settings:
+            fps = settings["fps"]
+        if "scale" in settings:
+            scale = float(settings["scale"])
+        if "voice" in settings:
+            voice = settings["voice"]
+        if "video_length" in settings:
+            video_length = int(settings["video_length"])
+        if "fade_duration" in settings:
+            fade_duration = float(settings["fade_duration"])
+        if "audio_padding" in settings:
+            audio_padding = int(settings["audio_padding"])
+
+        self.window = SracreWindow()
+        self.window.show()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(SracreApp(sys.argv).exec())
