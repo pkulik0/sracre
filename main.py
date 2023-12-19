@@ -8,6 +8,8 @@ from elevenlabs import generate, set_api_key
 ALLOWED_EXTENSIONS = ["png", "jpg", "jpeg", "webp"]
 DIRS = ["output/audio", "output/videos", "output/clips"]
 VIDEO_LENGTH = 15
+FADE_DURATION = 0.25
+AUDIO_PADDING = 1000
 
 
 def parse_args():
@@ -17,7 +19,7 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30, help="FPS")
     parser.add_argument("--scale", type=float, default=1.5, help="Peak scale of images")
     parser.add_argument("--voice", type=str, default="Adam", help="Voice")
-    parser.add_argument("--speed", type=float, default=1.0, help="Speed of the voice")
+    parser.add_argument("--speed", type=float, default=0.8, help="Speed of the voice")
     parser.add_argument("--api-key", type=str, default=None, help="Elevenlabs API key", required=True)
     args = parser.parse_args()
 
@@ -93,10 +95,9 @@ def generate_video(image, scale, fps):
     )
     print(f"Generating clip from \"{image}\" with end scale {scale} and duration {VIDEO_LENGTH}")
     (
-        ffmpeg
-        .input(image, loop=1, framerate=fps)
+        ffmpeg.input(image, loop=1, framerate=fps)
         .output(output, vcodec='libx264', t=VIDEO_LENGTH, vf=zoompan_filter, pix_fmt='yuv420p')
-        .run()
+        .run(quiet=True)
     )
     print("Saved clip to:", output)
     return output
@@ -120,15 +121,45 @@ def merge_audio_video(audio_path, video_path):
     print(f"Merging audio \"{audio_name}\" and video \"{video_name}\"")
     video_input = ffmpeg.input(video_path)
     audio_input = ffmpeg.input(audio_path)
-    merged = ffmpeg.output(video_input, audio_input, output,
-                           map='0:v,1:a',
-                           vcodec='copy', acodec='aac',
-                           strict='experimental',
-                           shortest=None,
-                           af='adelay=250|250')
-    ffmpeg.run(merged)
+    ffmpeg.output(video_input, audio_input, output,
+                  map='0:v,1:a',
+                  vcodec='copy', acodec='aac',
+                  strict='experimental',
+                  shortest=None,
+                  af=f'adelay={AUDIO_PADDING}|{AUDIO_PADDING},apad=pad_dur={AUDIO_PADDING/1000}').run(quiet=True)
     print(f"Saved clip to \"{output}\"")
     return output
+
+
+def concatenate_clips(clips):
+    video_filters = []
+    audio_filters = []
+    clips_hash = hashlib.sha256()
+    for clip in clips:
+        clip_name = os.path.splitext(os.path.basename(clip))[0]
+        clips_hash.update(clip_name.encode())
+
+        clip_input = ffmpeg.input(clip)
+
+        video = clip_input.video.filter('setpts', 'PTS-STARTPTS')
+        video = video.filter('fade', type='in', start_time=0, duration=FADE_DURATION)
+        video = video.filter('fade', type='out', start_time=VIDEO_LENGTH - FADE_DURATION, duration=FADE_DURATION)
+        video_filters.append(video)
+
+        audio = clip_input.audio.filter('afade', type='in', start_time=0, duration=FADE_DURATION)
+        audio = audio.filter('afade', type='out', start_time=VIDEO_LENGTH - FADE_DURATION, duration=FADE_DURATION)
+        audio_filters.append(audio)
+
+    output = f"output/{clips_hash.hexdigest()}.mp4"
+    if os.path.exists(output):
+        print(f"Concatenated clip for \"{clips_hash.hexdigest()}\" already exists. Remove it to regenerate.")
+        return output
+
+    print("Concatenating clips...")
+    concatenated_video = ffmpeg.concat(*video_filters, v=1, a=0)
+    concatenated_audio = ffmpeg.concat(*audio_filters, v=0, a=1)
+    ffmpeg.output(concatenated_video, concatenated_audio, output).run(quiet=True)
+    print("Saved concatenated clip to:", output)
 
 
 def main():
@@ -142,11 +173,9 @@ def main():
     for i, (line, image) in enumerate(zip(lines, images)):
         video_file = generate_video(image, args.scale, args.fps)
         audio_file = generate_audio(line, args.voice)
-        print("Merging audio and video...")
-        merged = merge_audio_video(audio_file, video_file)
+        clips.append(merge_audio_video(audio_file, video_file))
 
-    print("Concatenating clips...")
-    # TODO: this
+    concatenate_clips(clips)
 
 
 if __name__ == "__main__":
