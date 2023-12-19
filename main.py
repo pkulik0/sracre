@@ -1,14 +1,14 @@
 import argparse
 import os
+import hashlib
 
-import numpy as np
+import ffmpeg
 from PIL import Image
 from elevenlabs import generate, set_api_key
 
-from moviepy.editor import AudioFileClip, ImageSequenceClip
-
 ALLOWED_EXTENSIONS = ["png", "jpg", "jpeg", "webp"]
-DIRS = ["output", "output/audio", "output/frames", "output/clips"]
+DIRS = ["output/audio", "output/videos", "output/clips"]
+VIDEO_LENGTH = 15
 
 
 def parse_args():
@@ -16,14 +16,25 @@ def parse_args():
     parser.add_argument("--text", type=str, default="text.txt", help="File with voice-over text")
     parser.add_argument("--images", type=str, default="images", help="Images directory")
     parser.add_argument("--fps", type=int, default=30, help="FPS")
-    parser.add_argument("--scale", type=float, default=1.1, help="Peak scale of images")
+    parser.add_argument("--scale", type=float, default=1.5, help="Peak scale of images")
     parser.add_argument("--voice", type=str, default="Adam", help="Voice")
     parser.add_argument("--speed", type=float, default=1.0, help="Speed of the voice")
     parser.add_argument("--api-key", type=str, default=None, help="Elevenlabs API key", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    print("Settings: ")
+    print("\timages:", args.images)
+    print("\tfps:", args.fps)
+    print("\tscale:", args.scale)
+    print("\tvoice:", args.voice)
+    print("\ttext:", args.text)
+    print("\tspeed:", args.speed)
+    print("\tapi-key:", args.api_key)
+    return args
 
 
 def load_data(text_file, images_dir):
+    print(f"Loading text from \"{text_file}\"")
     lines = []
     with open(text_file, "r") as f:
         lines_raw = f.readlines()
@@ -32,6 +43,7 @@ def load_data(text_file, images_dir):
             if stripped:
                 lines.append(stripped)
 
+    print(f"Loading images from \"{images_dir}\"")
     images = []
     for i in range(len(lines)):
         was_found = False
@@ -39,70 +51,103 @@ def load_data(text_file, images_dir):
             filename = os.path.join(images_dir, f"{i}.{ext}")
             if os.path.exists(filename):
                 was_found = True
-                images.append(Image.open(filename))
+                images.append(filename)
                 break
         if not was_found:
             raise FileNotFoundError(f"Image {i} was not found")
     return lines, images
 
 
-def generate_audio(lines, voice):
-    audio_files = []
-    for i, line in enumerate(lines):
-        print("Generating output for line:", line)
-        audio = generate(
-            text=line,
-            voice=voice,
-            model="eleven_multilingual_v2",
-        )
-        path = f"output/audio/{i}.wav"
-        with open(path, "wb") as f:
-            f.write(audio)
-            print("Saved audio to:", f.name)
-            audio_files.append(AudioFileClip(path))
-    return audio_files
+def generate_audio(line, voice):
+    line_hash = hashlib.sha256(line.encode()).hexdigest()
+    path = f"output/audio/{line_hash}.wav"
+    if os.path.exists(path):
+        print(f"Audio for \"{line}\" already exists. Remove it to regenerate.")
+        return path
+
+    print("Generating audio for:", line)
+    audio = generate(
+        text=line,
+        voice=voice,
+        model="eleven_multilingual_v2",
+    )
+    with open(path, "wb") as f:
+        f.write(audio)
+    print("Saved audio to:", path)
+    return path
 
 
-def generate_frames(image, scale, fps, duration):
-    frames = []
-    total_frames = int(fps * duration)
-    for i, ratio in enumerate(np.linspace(1.0, scale, total_frames)):
-        old_size = image.size
-        new_size = tuple(int(x * ratio) for x in image.size)
-        resized = image.resize(new_size)
+def generate_video(image, scale, fps):
+    with open(image, "rb") as f:
+        image_hash = hashlib.sha256(f.read()).hexdigest()
 
-        left = (new_size[0] - old_size[0]) // 2
-        top = (new_size[1] - old_size[1]) // 2
-        right = left + old_size[0]
-        bottom = top + old_size[1]
-        cropped = resized.crop((left, top, right, bottom))
+    output = f"output/videos/{image_hash}.mp4"
+    if os.path.exists(output):
+        print(f"Video for \"{image}\" already exists. Remove it to regenerate.")
+        return output
 
-        path = f"output/frames/{i}.png"
-        cropped.save(path)
-        frames.append(path)
-    return frames
+    total_frames = int(VIDEO_LENGTH * fps)
+    zoom_increment = (scale - 1) / total_frames
+    zoompan_filter = (
+        f"scale=8000:-1,zoompan=z='min(zoom+{zoom_increment:.10f},{scale})':"
+        f"d={total_frames}:x='if(gte(zoom,1.5),x,x+1/a)':y='if(gte(zoom,1.5),y,y+1)':s=1920x1080"
+    )
+    print(f"Generating clip from \"{image}\" with end scale {scale} and duration {VIDEO_LENGTH}")
+    (
+        ffmpeg
+        .input(image, loop=1, framerate=fps)
+        .output(output, vcodec='libx264', t=VIDEO_LENGTH, vf=zoompan_filter, pix_fmt='yuv420p')
+        .run()
+    )
+    print("Saved clip to:", output)
+    return output
+
+
+def merge_audio_video(audio_path, video_path):
+    audio_info = ffmpeg.probe(audio_path)
+    video_info = ffmpeg.probe(video_path)
+    audio_duration = float(audio_info['format']['duration'])
+    video_duration = float(video_info['format']['duration'])
+    if video_duration < audio_duration:
+        raise ValueError("Video is shorter than audio")
+
+    audio_name = os.path.splitext(os.path.basename(audio_path))[0]
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    output = f"output/clips/{audio_name}_{video_name}.mp4"
+    if os.path.exists(output):
+        print(f"Clip for \"{audio_name}\" and \"{video_name}\" already exists. Remove it to regenerate.")
+        return output
+
+    print(f"Merging audio \"{audio_name}\" and video \"{video_name}\"")
+    video_input = ffmpeg.input(video_path)
+    audio_input = ffmpeg.input(audio_path)
+    merged = ffmpeg.output(video_input, audio_input, output,
+                           map='0:v,1:a',
+                           vcodec='copy', acodec='aac',
+                           strict='experimental',
+                           shortest=None,
+                           af='adelay=250|250')
+    ffmpeg.run(merged)
+    print(f"Saved clip to \"{output}\"")
+    return output
 
 
 def main():
     for directory in DIRS:
         os.makedirs(directory, exist_ok=True)
-
     args = parse_args()
-    print("Running with args:\n", args)
-
     set_api_key(args.api_key)
 
     lines, images = load_data(args.text, args.images)
+    clips = []
+    for i, (line, image) in enumerate(zip(lines, images)):
+        video_file = generate_video(image, args.scale, args.fps)
+        audio_file = generate_audio(line, args.voice)
+        print("Merging audio and video...")
+        merged = merge_audio_video(audio_file, video_file)
 
-    audio_files = generate_audio(lines, args.voice)
-    for i, (audio, image) in enumerate(zip(audio_files, images)):
-        frame_files = generate_frames(image, args.scale, args.fps, audio.duration)
-        print("Generated", len(frame_files), "frames")
-
-        clip = ImageSequenceClip(frame_files, fps=args.fps).set_audio(audio)
-        clip_path = "output/clips/{}.mp4".format(i)
-        clip.write_videofile(clip_path, fps=args.fps)
-        print("Saved subclip to:", clip_path)
+    print("Concatenating clips...")
+    # TODO: this
 
 
 if __name__ == "__main__":
