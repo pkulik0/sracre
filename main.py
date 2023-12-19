@@ -3,7 +3,6 @@ import os
 import hashlib
 
 import ffmpeg
-from PIL import Image
 from elevenlabs import generate, set_api_key
 
 ALLOWED_EXTENSIONS = ["png", "jpg", "jpeg", "webp"]
