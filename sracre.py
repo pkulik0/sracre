@@ -1,5 +1,7 @@
 import enum
 import sys
+from typing import Optional
+
 import deepl
 import sqlite3
 import os
@@ -11,9 +13,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QListWidget,
                              QPushButton, QWidget, QHBoxLayout,
                              QListWidgetItem, QVBoxLayout, QCheckBox,
                              QComboBox, QLabel, QScrollArea, QGroupBox,
-                             QMessageBox, QSlider, QLineEdit, QDialog, QTextEdit)
-from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent
+                             QMessageBox, QSlider, QLineEdit, QDialog,
+                             QTextEdit, QFileDialog)
+from PyQt6.QtCore import QSize, Qt, pyqtSignal, QPoint
+from PyQt6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QMouseEvent
 
 
 class Keychain:
@@ -28,24 +31,26 @@ class Keychain:
     def __init__(self, api_name):
         self.api_name = api_name
 
-    def get_key(self, quota_needed):
-        return Keychain.Entry(*cursor.execute("SELECT api, key, quota_used, quota_total, reset_time FROM keys "
-                                              "WHERE api = ? AND quota_total - quota_used >= ? ORDER BY "
-                                              "quota_used LIMIT 1", (self.api_name, quota_needed)).fetchone())
+    def get_key(self, db, quota_needed):
+        return Keychain.Entry(*db.cursor().execute("SELECT api, key, quota_used, quota_total, reset_time FROM keys "
+                                                   "WHERE api = ? AND quota_total - quota_used >= ? ORDER BY "
+                                                   "quota_used LIMIT 1", (self.api_name, quota_needed)).fetchone())
 
-    def add_key(self, key, quota):
-        cursor.execute("INSERT INTO keys (api, key, quota_used, quota_total, reset_time) VALUES (?, ?, ?, ?, ?)",
+    def add_key(self, db, key, quota):
+        db.cursor().execute("INSERT INTO keys (api, key, quota_used, quota_total, reset_time) VALUES (?, ?, ?, ?, ?)",
                             (self.api_name, key, 0, quota, 0))
         db.commit()
 
-    def incr_key_quota(self, key, quota):
-        cursor.execute("UPDATE keys SET quota_used = quota_used + ? WHERE key = ?", (quota, key))
+    def update_quota(self, db, key, current, total, reset_time):
+        print(f"Updating quota for {key} to {current}/{total} with reset time {reset_time}")
+        db.cursor().execute("UPDATE keys SET quota_used = ?, quota_total = ?, reset_time = ? WHERE api = ? AND key = ?"
+                            , (current, total, reset_time, self.api_name, key))
         db.commit()
 
-    def get_all_keys(self):
-        return [Keychain.Entry(*row) for row in cursor.execute("SELECT api, key, quota_used, quota_total, "
-                                                               "reset_time FROM keys WHERE api = ?",
-                                                               (self.api_name,)).fetchall()]
+    def get_all_keys(self, db):
+        return [Keychain.Entry(*row) for row in db.cursor().execute("SELECT api, key, quota_used, quota_total, "
+                                                                    "reset_time FROM keys WHERE api = ?",
+                                                                    (self.api_name,)).fetchall()]
 
 
 ICON_SIZE = 128
@@ -61,28 +66,25 @@ video_length = 15
 fade_duration = 0.25
 audio_padding = 1000
 
-db = sqlite3.connect("sracre.db")
-cursor = db.cursor()
-
 deepl_keychain = Keychain("deepl")
 elevenlabs_keychain = Keychain("elevenlabs")
 
-translator = deepl.Translator(deepl_keychain.get_key(0).key)
+translator: Optional[deepl.Translator] = None
 selected_languages = []
 source_language = "???"
 
 
-def get_settings():
-    result = cursor.execute("SELECT key, value FROM settings").fetchall()
+def get_settings(db):
+    result = db.cursor().execute("SELECT key, value FROM settings").fetchall()
     return {key: value for key, value in result}
 
 
-def set_setting(key, value):
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+def set_setting(db, key, value):
+    db.cursor().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     db.commit()
 
 
-def generate_audio(line, voice):
+def generate_audio(line):
     line_hash = hashlib.sha256(line.encode()).hexdigest()
     path = f"output/audio/{line_hash}.wav"
     if os.path.exists(path):
@@ -90,6 +92,10 @@ def generate_audio(line, voice):
         return path
 
     print("Generating audio for:", line)
+    db = sqlite3.connect("sracre.db")
+    key = elevenlabs_keychain.get_key(db, len(line))
+    elevenlabs.set_api_key(key.key)
+
     audio = elevenlabs.generate(
         text=line,
         voice=voice,
@@ -98,6 +104,11 @@ def generate_audio(line, voice):
     with open(path, "wb") as f:
         f.write(audio)
     print("Saved audio to:", path)
+
+    user_info = elevenlabs.User.from_api().subscription
+    elevenlabs_keychain.update_quota(db, key.key, user_info.character_count, user_info.character_limit,
+                                     user_info.next_character_count_reset_unix)
+
     return path
 
 
@@ -121,7 +132,8 @@ def generate_video(image, anim_type):
     zoom_increment = (scale - 1) / total_frames
     zoompan_filter = (
         f"scale=8000:-1,zoompan=z='min(zoom+{zoom_increment:.10f},{scale})':"
-        f"d={total_frames}:x='if(gte(zoom,1.5),x,x{'+' if anim_type.value % 2 else '-'}1/a)':y='if(gte(zoom,1.5),y,y{'+' if anim_type.value > 2 else '-'}1)':s=1920x1080"
+        f"d={total_frames}:x='if(gte(zoom,1.5),x,x{'+' if anim_type.value % 2 else '-'}1/a)'"
+        f":y='if(gte(zoom,1.5),y,y{'+' if anim_type.value > 2 else '-'}1)':s=1920x1080"
     )
     print(f"Generating clip from \"{image}\" with end scale {scale} and duration {video_length}")
     (
@@ -156,7 +168,7 @@ def merge_audio_video(audio_path, video_path):
                   vcodec='copy', acodec='aac',
                   strict='experimental',
                   shortest=None,
-                  af=f'adelay={audio_padding}|{audio_padding},apad=pad_dur={audio_padding/1000}').run(quiet=True)
+                  af=f'adelay={audio_padding}|{audio_padding},apad=pad_dur={audio_padding / 1000}').run(quiet=True)
     print(f"Saved clip to \"{output}\"")
     return output
 
@@ -194,7 +206,7 @@ def concatenate_clips(clips):
 
 def create_clip(line, image, anim_type):
     video_file = generate_video(image, anim_type)
-    audio_file = generate_audio(line, voice)
+    audio_file = generate_audio(line)
     return merge_audio_video(audio_file, video_file)
 
 
@@ -215,7 +227,29 @@ def process_items(items):
     concatenate_clips(clips)
 
 
-class MainList(QWidget):
+class ListWidget(QListWidget):
+    imageDoubleClicked = pyqtSignal(QListWidgetItem)
+    textDoubleClicked = pyqtSignal(QListWidgetItem)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        item = self.itemAt(event.pos())
+        if not item:
+            return
+
+        if self.is_image_click(event.pos(), item):
+            self.imageDoubleClicked.emit(item)
+            return
+
+        self.textDoubleClicked.emit(item)
+        super().mouseDoubleClickEvent(event)
+
+    def is_image_click(self, click_position: QPoint, item: QListWidgetItem):
+        icon_area = self.visualItemRect(item)
+        icon_area.setWidth(self.iconSize().width())  # Assume icon is at the left
+        return icon_area.contains(click_position)
+
+
+class EditorWidget(QWidget):
     def __init__(self):
         super().__init__()
 
@@ -226,11 +260,12 @@ class MainList(QWidget):
         self.text_list = []
         self.items = []
 
-        self.list_widget = QListWidget()
+        self.list_widget = ListWidget()
         self.list_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.list_widget.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
+        self.list_widget.imageDoubleClicked.connect(self.on_image_double_clicked)
+        self.list_widget.itemChanged.connect(self.on_item_changed)
         self.layout.addWidget(self.list_widget)
-
 
         self.buttons_layout = QHBoxLayout()
         self.buttons_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -273,8 +308,17 @@ class MainList(QWidget):
         pixmap = QPixmap(path)
         icon = QIcon(pixmap)
         item = QListWidgetItem(icon, self.get_next_text())
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
         self.list_widget.addItem(item)
         self.items.append((path, "???"))
+
+    def on_image_double_clicked(self, item):
+        row = self.list_widget.row(item)
+        ext_filter = f"Images ({' '.join(['*' + ext for ext in IMAGE_EXT])})"
+        new_image_path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", ext_filter)
+        if new_image_path:
+            self.items[row] = (new_image_path, self.items[row][1])
+            self.list_widget.item(row).setIcon(QIcon(QPixmap(new_image_path)))
 
     def get_next_text(self):
         return self.text_list.pop() if self.text_list else "???"
@@ -291,6 +335,10 @@ class MainList(QWidget):
         for i in range(self.list_widget.count()):
             self.items[i] = (self.items[i][0], self.get_next_text() if i < filled_up_to else "???")
             self.list_widget.item(i).setText(self.items[i][1])
+
+    def on_item_changed(self, item):
+        row = self.list_widget.row(item)
+        self.items[row] = (self.items[row][0], item.text())
 
     def remove_item(self):
         if self.list_widget.count() == 0:
@@ -477,7 +525,7 @@ class SettingsWidget(QWidget):
         self.voice_combo.currentTextChanged.connect(self.update_voice)
         self.layout.addWidget(self.voice_combo)
 
-        self.scale_label = QLabel(f"Scale ({scale}):")
+        self.scale_label = QLabel(f"Final scale ({scale}):")
         self.layout.addWidget(self.scale_label)
 
         self.scale_slider = QSlider(Qt.Orientation.Horizontal)
@@ -554,7 +602,7 @@ class SettingsWidget(QWidget):
 
         global scale
         scale = rounded_value / 100
-        self.scale_label.setText(f"Scale ({scale}):")
+        self.scale_label.setText(f"Final scale ({scale}):")
         set_setting("scale", scale)
 
     def update_voice(self, value):
@@ -621,7 +669,7 @@ class SracreWindow(QMainWindow):
         self.editor_group.setLayout(self.editor_group_layout)
         self.editor_layout.addWidget(self.editor_group, 2)
 
-        self.list_widget = MainList()
+        self.list_widget = EditorWidget()
         self.editor_group_layout.addWidget(self.list_widget)
 
         self.language_group = QGroupBox("Settings")
@@ -654,13 +702,6 @@ class SracreWindow(QMainWindow):
             event.ignore()
 
 
-def setup_db():
-    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS keys (api TEXT, key TEXT, quota_used INTEGER, quota_total INTEGER, "
-                   "reset_time INTEGER)")
-    db.commit()
-
-
 class SracreApp(QApplication):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -668,10 +709,17 @@ class SracreApp(QApplication):
         for directory in OUT_DIRS:
             os.makedirs(directory, exist_ok=True)
 
-        setup_db()
-        elevenlabs.set_api_key(elevenlabs_keychain.get_key(0).key)
+        with sqlite3.connect("sracre.db") as db:
+            cursor = db.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS keys (api TEXT, key TEXT, quota_used INTEGER, "
+                           "quota_total INTEGER, reset_time INTEGER)")
+            db.commit()
+            global translator
+            translator = deepl.Translator(deepl_keychain.get_key(db, 0).key)
+            elevenlabs.set_api_key(elevenlabs_keychain.get_key(db, 0).key)
+            settings = get_settings(db)
 
-        settings = get_settings()
         global source_language, selected_languages, fps, scale, voice, video_length, fade_duration, audio_padding
         if "source_language" in settings:
             source_language = settings["source_language"]
