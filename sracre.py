@@ -1,25 +1,26 @@
-import enum
-import sys
-from typing import Optional
-
-import deepl
-import sqlite3
-import os
-import hashlib
-import elevenlabs
-import ffmpeg
-import threading
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QListWidget,
                              QPushButton, QWidget, QHBoxLayout,
                              QListWidgetItem, QVBoxLayout, QCheckBox,
                              QComboBox, QLabel, QScrollArea, QGroupBox,
                              QMessageBox, QSlider, QLineEdit, QDialog,
                              QTextEdit, QFileDialog)
-from PyQt6.QtCore import QSize, Qt, pyqtSignal, QPoint
-from PyQt6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QMouseEvent
+from PyQt6.QtCore import QSize, Qt, pyqtSignal, QPoint, QThread
+from PyQt6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QMouseEvent, QTextCursor
+import random
+import sys
+from typing import Optional
+import deepl
+import sqlite3
+import os
+import hashlib
+import elevenlabs
+import ffmpeg
 
 
 class Keychain:
+    class Error(Exception):
+        pass
+
     class Entry:
         def __init__(self, api_name, key, quota_used, quota_total, reset_time):
             self.api_name = api_name
@@ -31,26 +32,33 @@ class Keychain:
     def __init__(self, api_name):
         self.api_name = api_name
 
-    def get_key(self, db, quota_needed):
-        return Keychain.Entry(*db.cursor().execute("SELECT api, key, quota_used, quota_total, reset_time FROM keys "
-                                                   "WHERE api = ? AND quota_total - quota_used >= ? ORDER BY "
-                                                   "quota_used LIMIT 1", (self.api_name, quota_needed)).fetchone())
+    def get_key(self, db_, quota_needed):
+        try:
+            return Keychain.Entry(
+                *db_.cursor().execute("SELECT api, key, quota_used, quota_total, reset_time FROM keys "
+                                      "WHERE api = ? AND quota_total - quota_used >= ? ORDER BY "
+                                      "quota_used LIMIT 1", (self.api_name, quota_needed)).fetchone())
+        except TypeError:
+            raise Keychain.Error("No keys available")
 
-    def add_key(self, db, key, quota):
-        db.cursor().execute("INSERT INTO keys (api, key, quota_used, quota_total, reset_time) VALUES (?, ?, ?, ?, ?)",
-                            (self.api_name, key, 0, quota, 0))
-        db.commit()
+    def add_key(self, db_, key, total_quota):
+        db_.cursor().execute("INSERT INTO keys (api, key, quota_used, quota_total, reset_time) VALUES (?, ?, ?, ?, ?)",
+                             (self.api_name, key, 0, total_quota, 0))
+        db_.commit()
 
-    def update_quota(self, db, key, current, total, reset_time):
+    def update_quota(self, db_, key, current, total, reset_time):
         print(f"Updating quota for {key} to {current}/{total} with reset time {reset_time}")
-        db.cursor().execute("UPDATE keys SET quota_used = ?, quota_total = ?, reset_time = ? WHERE api = ? AND key = ?"
-                            , (current, total, reset_time, self.api_name, key))
-        db.commit()
+        db_.cursor().execute("UPDATE keys SET quota_used = ?, quota_total = ?, reset_time = ? WHERE api = ? AND key = ?"
+                             , (current, total, reset_time, self.api_name, key))
+        db_.commit()
 
-    def get_all_keys(self, db):
-        return [Keychain.Entry(*row) for row in db.cursor().execute("SELECT api, key, quota_used, quota_total, "
-                                                                    "reset_time FROM keys WHERE api = ?",
-                                                                    (self.api_name,)).fetchall()]
+    def get_all_keys(self, db_):
+        try:
+            return [Keychain.Entry(*row) for row in db_.cursor().execute("SELECT api, key, quota_used, quota_total, "
+                                                                         "reset_time FROM keys WHERE api = ?",
+                                                                         (self.api_name,)).fetchall()]
+        except TypeError:
+            raise Keychain.Error("No keys available")
 
 
 ICON_SIZE = 128
@@ -64,7 +72,7 @@ scale = 1.5
 voice = "???"
 video_length = 15
 fade_duration = 0.25
-audio_padding = 1000
+audio_padding = 0.75
 
 deepl_keychain = Keychain("deepl")
 elevenlabs_keychain = Keychain("elevenlabs")
@@ -73,27 +81,35 @@ translator: Optional[deepl.Translator] = None
 selected_languages = []
 source_language = "???"
 
+db = sqlite3.connect("sracre.db")
 
-def get_settings(db):
+
+def get_settings():
     result = db.cursor().execute("SELECT key, value FROM settings").fetchall()
     return {key: value for key, value in result}
 
 
-def set_setting(db, key, value):
+def set_setting(key, value):
     db.cursor().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     db.commit()
 
 
+def get_hash(items):
+    hash_ = hashlib.sha256()
+    for item in items:
+        hash_.update(str(item).encode())
+    return hash_.hexdigest()
+
+
 def generate_audio(line):
-    line_hash = hashlib.sha256(line.encode()).hexdigest()
-    path = f"output/audio/{line_hash}.wav"
+    path = f"output/audio/{get_hash([line, voice])}.wav"
     if os.path.exists(path):
         print(f"Audio for \"{line}\" already exists. Remove it to regenerate.")
         return path
 
     print("Generating audio for:", line)
-    db = sqlite3.connect("sracre.db")
-    key = elevenlabs_keychain.get_key(db, len(line))
+    db_ = sqlite3.connect("sracre.db")
+    key = elevenlabs_keychain.get_key(db_, len(line))
     elevenlabs.set_api_key(key.key)
 
     audio = elevenlabs.generate(
@@ -106,43 +122,51 @@ def generate_audio(line):
     print("Saved audio to:", path)
 
     user_info = elevenlabs.User.from_api().subscription
-    elevenlabs_keychain.update_quota(db, key.key, user_info.character_count, user_info.character_limit,
+    elevenlabs_keychain.update_quota(db_, key.key, user_info.character_count, user_info.character_limit,
                                      user_info.next_character_count_reset_unix)
 
     return path
 
 
-class AnimType(enum.Enum):
-    POS_X_NEG_Y = 0
-    NEG_X_NEG_Y = 1
-    POS_X_POS_Y = 2
-    NEG_X_POS_Y = 3
+PAN_DIRECTIONS = [-1, 1]
+last_pan_directions = (random.choice(PAN_DIRECTIONS), random.choice(PAN_DIRECTIONS))
 
 
-def generate_video(image, anim_type):
+def get_next_pan_directions():
+    global last_pan_directions
+    pan_directions = last_pan_directions
+    while pan_directions == last_pan_directions:
+        pan_directions = (random.choice(PAN_DIRECTIONS), random.choice(PAN_DIRECTIONS))
+    last_pan_directions = pan_directions
+    return pan_directions
+
+
+def generate_video(image):
     with open(image, "rb") as f:
-        image_hash = hashlib.sha256(f.read()).hexdigest()
-
-    output = f"output/videos/{image_hash}.mp4"
-    if os.path.exists(output):
+        output_path = f"output/videos/{get_hash([f.read(), scale, video_length, fps])}.mp4"
+    if os.path.exists(output_path):
         print(f"Video for \"{image}\" already exists. Remove it to regenerate.")
-        return output
+        return output_path
 
     total_frames = int(video_length * fps)
     zoom_increment = (scale - 1) / total_frames
+    pan_directions = get_next_pan_directions()
     zoompan_filter = (
-        f"scale=8000:-1,zoompan=z='min(zoom+{zoom_increment:.10f},{scale})':"
-        f"d={total_frames}:x='if(gte(zoom,1.5),x,x{'+' if anim_type.value % 2 else '-'}1/a)'"
-        f":y='if(gte(zoom,1.5),y,y{'+' if anim_type.value > 2 else '-'}1)':s=1920x1080"
+        f"scale=8000:-1,zoompan="
+        f"z='min(zoom+{zoom_increment:.10f},{scale})'"
+        f":x='(x+{pan_directions[0]})/a*on'"
+        f":y='(y+{pan_directions[1]})*on'"
+        f":d={total_frames}"
+        f":s=1920x1080"
     )
     print(f"Generating clip from \"{image}\" with end scale {scale} and duration {video_length}")
     (
         ffmpeg.input(image, loop=1, framerate=fps)
-        .output(output, vcodec='libx264', t=video_length, vf=zoompan_filter, pix_fmt='yuv420p')
+        .output(output_path, vcodec='libx264', t=video_length, vf=zoompan_filter, pix_fmt='yuv420p')
         .run(quiet=True)
     )
-    print("Saved clip to:", output)
-    return output
+    print("Saved clip to:", output_path)
+    return output_path
 
 
 def merge_audio_video(audio_path, video_path):
@@ -150,37 +174,40 @@ def merge_audio_video(audio_path, video_path):
     video_info = ffmpeg.probe(video_path)
     audio_duration = float(audio_info['format']['duration'])
     video_duration = float(video_info['format']['duration'])
-    if video_duration < audio_duration:
-        raise ValueError("Video is shorter than audio")
+    total_duration = audio_duration + audio_padding
+    if video_duration < total_duration:
+        raise ValueError(f"Video is shorter than audio by {(total_duration - video_duration):.2f}s")
 
     audio_name = os.path.splitext(os.path.basename(audio_path))[0]
     video_name = os.path.splitext(os.path.basename(video_path))[0]
-    output = f"output/clips/{audio_name}_{video_name}.mp4"
-    if os.path.exists(output):
+    output_path = f"output/clips/{get_hash([audio_name, video_name])}.mp4"
+    if os.path.exists(output_path):
         print(f"Clip for \"{audio_name}\" and \"{video_name}\" already exists. Remove it to regenerate.")
-        return output
+        return output_path
 
     print(f"Merging audio \"{audio_name}\" and video \"{video_name}\"")
     video_input = ffmpeg.input(video_path)
+    video_input = video_input.trim(start=0, end=total_duration)
+
     audio_input = ffmpeg.input(audio_path)
-    ffmpeg.output(video_input, audio_input, output,
-                  map='0:v,1:a',
-                  vcodec='copy', acodec='aac',
-                  strict='experimental',
-                  shortest=None,
-                  af=f'adelay={audio_padding}|{audio_padding},apad=pad_dur={audio_padding / 1000}').run(quiet=True)
-    print(f"Saved clip to \"{output}\"")
-    return output
+    silent_audio = ffmpeg.input('anullsrc', f='lavfi', t=audio_padding)
+    concat_audio = ffmpeg.concat(silent_audio, audio_input, silent_audio, v=0, a=1).filter('atrim', duration=total_duration)
+
+    ffmpeg.output(video_input, concat_audio, output_path, vcodec='libx264', acodec='aac').run(quiet=True)
+    print(f"Saved clip to \"{output_path}\"")
+    return output_path
 
 
 def concatenate_clips(clips):
     video_filters = []
     audio_filters = []
-    clips_hash = hashlib.sha256()
-    for clip in clips:
-        clip_name = os.path.splitext(os.path.basename(clip))[0]
-        clips_hash.update(clip_name.encode())
+    clips_hash = get_hash([os.path.splitext(os.path.basename(clip))[0] for clip in clips])
+    output_path = f"output/{clips_hash}.mp4"
+    if os.path.exists(output_path):
+        print(f"Concatenated clip for \"{output_path}\" already exists. Remove it to regenerate.")
+        return output_path
 
+    for clip in clips:
         clip_input = ffmpeg.input(clip)
 
         video = clip_input.video.filter('setpts', 'PTS-STARTPTS')
@@ -192,20 +219,15 @@ def concatenate_clips(clips):
         audio = audio.filter('afade', type='out', start_time=video_length - fade_duration, duration=fade_duration)
         audio_filters.append(audio)
 
-    output = f"output/{clips_hash.hexdigest()}.mp4"
-    if os.path.exists(output):
-        print(f"Concatenated clip for \"{clips_hash.hexdigest()}\" already exists. Remove it to regenerate.")
-        return output
-
     print("Concatenating clips...")
     concatenated_video = ffmpeg.concat(*video_filters, v=1, a=0)
     concatenated_audio = ffmpeg.concat(*audio_filters, v=0, a=1)
-    ffmpeg.output(concatenated_video, concatenated_audio, output).run(quiet=True)
-    print("Saved concatenated clip to:", output)
+    ffmpeg.output(concatenated_video, concatenated_audio, output_path).run(quiet=True)
+    print("Saved concatenated clip to:", output_path)
 
 
-def create_clip(line, image, anim_type):
-    video_file = generate_video(image, anim_type)
+def create_clip(line, image):
+    video_file = generate_video(image)
     audio_file = generate_audio(line)
     return merge_audio_video(audio_file, video_file)
 
@@ -217,14 +239,29 @@ def get_voices():
 
 def process_items(items):
     clips = []
-    anim_type = AnimType.POS_X_NEG_Y
     for (image, text) in items:
-        clips.append(create_clip(text, image, anim_type))
-        new_anim_type = anim_type.value + 1
-        if new_anim_type > AnimType.NEG_X_POS_Y.value:
-            new_anim_type = 0
-        anim_type = AnimType(new_anim_type)
+        clips.append(create_clip(text, image))
     concatenate_clips(clips)
+
+
+class WorkerThread(QThread):
+    show_generic_error = pyqtSignal()
+    show_key_error = pyqtSignal()
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = items
+        self.error = None
+
+    def run(self):
+        try:
+            process_items(self.items)
+        except Keychain.Error as e:
+            self.error = e
+            self.show_key_error.emit()
+        except Exception as e:
+            self.error = e
+            self.show_generic_error.emit()
 
 
 class ListWidget(QListWidget):
@@ -253,6 +290,7 @@ class EditorWidget(QWidget):
     def __init__(self):
         super().__init__()
 
+        self.worker = None
         self.layout = QVBoxLayout(self)
         self.setLayout(self.layout)
         self.setAcceptDrops(True)
@@ -397,7 +435,16 @@ class EditorWidget(QWidget):
                 return
 
         print("Starting...")
-        threading.Thread(target=process_items, args=(self.items,)).start()
+        self.worker = WorkerThread(self.items)
+        self.worker.show_generic_error.connect(self.show_generic_error_dialog)
+        self.worker.show_key_error.connect(self.show_key_error_dialog)
+        self.worker.start()
+
+    def show_generic_error_dialog(self):
+        QMessageBox.critical(self, "Error", str(self.worker.error))
+
+    def show_key_error_dialog(self):
+        QMessageBox.critical(self, "Error", "No keys available, check available quota")
 
 
 class ApiKeysWindow(QDialog):
@@ -412,7 +459,7 @@ class ApiKeysWindow(QDialog):
             self.label = QLabel(f"{name} API Keys:")
             self.addWidget(self.label)
 
-            self.keys = api.get_all_keys()
+            self.keys = api.get_all_keys(db)
 
             self.list = QListWidget()
             self.addWidget(self.list)
@@ -435,7 +482,7 @@ class ApiKeysWindow(QDialog):
             key = self.add_edit.text().strip()
             if not key:
                 return
-            self.api.add_key(key, self.max_quota)
+            self.api.add_key(db, key, self.max_quota)
             self.list.addItem(f"{key} (0/{self.max_quota})")
 
     def __init__(self):
@@ -561,15 +608,15 @@ class SettingsWidget(QWidget):
         self.fade_duration_slider.valueChanged.connect(self.update_fade_duration)
         self.layout.addWidget(self.fade_duration_slider)
 
-        self.audio_padding_label = QLabel(f"Audio padding ({audio_padding}ms):")
+        self.audio_padding_label = QLabel(f"Audio padding ({audio_padding}s):")
         self.layout.addWidget(self.audio_padding_label)
 
         self.audio_padding_slider = QSlider(Qt.Orientation.Horizontal)
         self.audio_padding_slider.setMinimum(0)
-        self.audio_padding_slider.setMaximum(2000)
-        self.audio_padding_slider.setTickInterval(250)
-        self.audio_padding_slider.setSingleStep(250)
-        self.audio_padding_slider.setValue(audio_padding)
+        self.audio_padding_slider.setMaximum(200)
+        self.audio_padding_slider.setTickInterval(25)
+        self.audio_padding_slider.setSingleStep(25)
+        self.audio_padding_slider.setValue(int(audio_padding * 100))
         self.audio_padding_slider.valueChanged.connect(self.update_audio_padding)
         self.layout.addWidget(self.audio_padding_slider)
 
@@ -626,11 +673,11 @@ class SettingsWidget(QWidget):
         set_setting("fade_duration", fade_duration)
 
     def update_audio_padding(self, value):
-        rounded_value = value // 250 * 250
+        rounded_value = value // 25 * 25
         self.audio_padding_slider.setValue(rounded_value)
 
         global audio_padding
-        audio_padding = rounded_value
+        audio_padding = rounded_value / 100
         self.audio_padding_label.setText(f"Audio padding ({audio_padding}ms):")
         set_setting("audio_padding", audio_padding)
 
@@ -645,6 +692,7 @@ class StreamRedirector:
 
     def write(self, text):
         self.text_widget.insertPlainText(text)
+        self.text_widget.moveCursor(QTextCursor.MoveOperation.End)
 
     def flush(self):
         pass
@@ -688,7 +736,10 @@ class SracreWindow(QMainWindow):
         self.output_textedit = QTextEdit()
         self.output_textedit.setReadOnly(True)
         self.output_group_layout.addWidget(self.output_textedit)
-        sys.stdout = StreamRedirector(self.output_textedit)
+
+        out_redirector = StreamRedirector(self.output_textedit)
+        sys.stdout = out_redirector
+        sys.stderr = out_redirector
 
         print("Welcome to sracre! Waiting for work...")
         self.show()
@@ -709,16 +760,15 @@ class SracreApp(QApplication):
         for directory in OUT_DIRS:
             os.makedirs(directory, exist_ok=True)
 
-        with sqlite3.connect("sracre.db") as db:
-            cursor = db.cursor()
-            cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-            cursor.execute("CREATE TABLE IF NOT EXISTS keys (api TEXT, key TEXT, quota_used INTEGER, "
-                           "quota_total INTEGER, reset_time INTEGER)")
-            db.commit()
-            global translator
-            translator = deepl.Translator(deepl_keychain.get_key(db, 0).key)
-            elevenlabs.set_api_key(elevenlabs_keychain.get_key(db, 0).key)
-            settings = get_settings(db)
+        cursor = db.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS keys (api TEXT, key TEXT, quota_used INTEGER, "
+                       "quota_total INTEGER, reset_time INTEGER)")
+        db.commit()
+        global translator
+        translator = deepl.Translator(deepl_keychain.get_key(db, 0).key)
+        elevenlabs.set_api_key(elevenlabs_keychain.get_key(db, 0).key)
+        settings = get_settings()
 
         global source_language, selected_languages, fps, scale, voice, video_length, fade_duration, audio_padding
         if "source_language" in settings:
@@ -736,7 +786,7 @@ class SracreApp(QApplication):
         if "fade_duration" in settings:
             fade_duration = float(settings["fade_duration"])
         if "audio_padding" in settings:
-            audio_padding = int(settings["audio_padding"])
+            audio_padding = float(settings["audio_padding"])
 
         self.window = SracreWindow()
         self.window.show()
