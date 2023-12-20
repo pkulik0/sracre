@@ -1,3 +1,4 @@
+import enum
 import sys
 import deepl
 import sqlite3
@@ -5,6 +6,7 @@ import os
 import hashlib
 import elevenlabs
 import ffmpeg
+import threading
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QListWidget,
                              QPushButton, QWidget, QHBoxLayout,
                              QListWidgetItem, QVBoxLayout, QCheckBox,
@@ -14,7 +16,7 @@ from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent
 
 
-class Api:
+class Keychain:
     class Entry:
         def __init__(self, api_name, key, quota_used, quota_total, reset_time):
             self.api_name = api_name
@@ -23,27 +25,25 @@ class Api:
             self.quota_total = quota_total
             self.reset_time = reset_time
 
-    def __init__(self, api_name, db):
-        self.db = db
-        self.cursor = db.cursor()
+    def __init__(self, api_name):
         self.api_name = api_name
 
     def get_key(self, quota_needed):
-        return Api.Entry(*self.cursor.execute("SELECT api, key, quota_used, quota_total, reset_time FROM keys "
+        return Keychain.Entry(*cursor.execute("SELECT api, key, quota_used, quota_total, reset_time FROM keys "
                                               "WHERE api = ? AND quota_total - quota_used >= ? ORDER BY "
                                               "quota_used LIMIT 1", (self.api_name, quota_needed)).fetchone())
 
     def add_key(self, key, quota):
-        self.cursor.execute("INSERT INTO keys (api, key, quota_used, quota_total, reset_time) VALUES (?, ?, ?, ?, ?)",
+        cursor.execute("INSERT INTO keys (api, key, quota_used, quota_total, reset_time) VALUES (?, ?, ?, ?, ?)",
                             (self.api_name, key, 0, quota, 0))
-        self.db.commit()
+        db.commit()
 
     def incr_key_quota(self, key, quota):
-        self.cursor.execute("UPDATE keys SET quota_used = quota_used + ? WHERE key = ?", (quota, key))
-        self.db.commit()
+        cursor.execute("UPDATE keys SET quota_used = quota_used + ? WHERE key = ?", (quota, key))
+        db.commit()
 
     def get_all_keys(self):
-        return [Api.Entry(*row) for row in self.cursor.execute("SELECT api, key, quota_used, quota_total, "
+        return [Keychain.Entry(*row) for row in cursor.execute("SELECT api, key, quota_used, quota_total, "
                                                                "reset_time FROM keys WHERE api = ?",
                                                                (self.api_name,)).fetchall()]
 
@@ -64,10 +64,10 @@ audio_padding = 1000
 db = sqlite3.connect("sracre.db")
 cursor = db.cursor()
 
-deepl_api = Api("deepl", db)
-elevenlabs_api = Api("elevenlabs", db)
+deepl_keychain = Keychain("deepl")
+elevenlabs_keychain = Keychain("elevenlabs")
 
-translator = deepl.Translator(deepl_api.get_key(0).key)
+translator = deepl.Translator(deepl_keychain.get_key(0).key)
 selected_languages = []
 source_language = "???"
 
@@ -101,7 +101,14 @@ def generate_audio(line, voice):
     return path
 
 
-def generate_video(image):
+class AnimType(enum.Enum):
+    POS_X_NEG_Y = 0
+    NEG_X_NEG_Y = 1
+    POS_X_POS_Y = 2
+    NEG_X_POS_Y = 3
+
+
+def generate_video(image, anim_type):
     with open(image, "rb") as f:
         image_hash = hashlib.sha256(f.read()).hexdigest()
 
@@ -114,7 +121,7 @@ def generate_video(image):
     zoom_increment = (scale - 1) / total_frames
     zoompan_filter = (
         f"scale=8000:-1,zoompan=z='min(zoom+{zoom_increment:.10f},{scale})':"
-        f"d={total_frames}:x='if(gte(zoom,1.5),x,x+1/a)':y='if(gte(zoom,1.5),y,y+1)':s=1920x1080"
+        f"d={total_frames}:x='if(gte(zoom,1.5),x,x{'+' if anim_type.value % 2 else '-'}1/a)':y='if(gte(zoom,1.5),y,y{'+' if anim_type.value > 2 else '-'}1)':s=1920x1080"
     )
     print(f"Generating clip from \"{image}\" with end scale {scale} and duration {video_length}")
     (
@@ -185,8 +192,8 @@ def concatenate_clips(clips):
     print("Saved concatenated clip to:", output)
 
 
-def create_clip(line, image):
-    video_file = generate_video(image)
+def create_clip(line, image, anim_type):
+    video_file = generate_video(image, anim_type)
     audio_file = generate_audio(line, voice)
     return merge_audio_video(audio_file, video_file)
 
@@ -196,10 +203,15 @@ def get_voices():
     return sorted([v.name for v in voices])
 
 
-def do_work(lines, images):
+def process_items(items):
     clips = []
-    for i, (line, image) in enumerate(zip(lines, images)):
-        clips.append(create_clip(line, image))
+    anim_type = AnimType.POS_X_NEG_Y
+    for (image, text) in items:
+        clips.append(create_clip(text, image, anim_type))
+        new_anim_type = anim_type.value + 1
+        if new_anim_type > AnimType.NEG_X_POS_Y.value:
+            new_anim_type = 0
+        anim_type = AnimType(new_anim_type)
     concatenate_clips(clips)
 
 
@@ -212,6 +224,7 @@ class MainList(QWidget):
         self.setAcceptDrops(True)
 
         self.text_list = []
+        self.items = []
 
         self.list_widget = QListWidget()
         self.list_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
@@ -261,21 +274,23 @@ class MainList(QWidget):
         icon = QIcon(pixmap)
         item = QListWidgetItem(icon, self.get_next_text())
         self.list_widget.addItem(item)
+        self.items.append((path, "???"))
 
     def get_next_text(self):
         return self.text_list.pop() if self.text_list else "???"
 
     def load_text(self, path):
+        self.text_list.clear()
         with open(path, 'r') as file:
             self.text_list.extend(line.strip() for line in file if line.strip())
             self.text_list.reverse()
             self.update_text()
 
     def update_text(self):
+        filled_up_to = min(self.list_widget.count(), len(self.text_list))
         for i in range(self.list_widget.count()):
-            self.list_widget.item(i).setText("???")
-        for i in range(min(self.list_widget.count(), len(self.text_list))):
-            self.list_widget.item(i).setText(self.get_next_text())
+            self.items[i] = (self.items[i][0], self.get_next_text() if i < filled_up_to else "???")
+            self.list_widget.item(i).setText(self.items[i][1])
 
     def remove_item(self):
         if self.list_widget.count() == 0:
@@ -283,26 +298,32 @@ class MainList(QWidget):
         if QMessageBox.question(self, "Confirm Remove", "Are you sure you want to remove the selected item?",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-            self.list_widget.takeItem(self.list_widget.currentRow())
+            row = self.list_widget.currentRow()
+            self.list_widget.takeItem(row)
+            self.items.pop(row)
 
     def move_up(self):
         current = self.list_widget.currentRow()
         if current > 0:
             self.list_widget.insertItem(current - 1, self.list_widget.takeItem(current))
             self.list_widget.setCurrentRow(current - 1)
+            self.items[current], self.items[current - 1] = self.items[current - 1], self.items[current]
 
     def move_down(self):
         current = self.list_widget.currentRow()
         if current < self.list_widget.count() - 1:
             self.list_widget.insertItem(current + 1, self.list_widget.takeItem(current))
             self.list_widget.setCurrentRow(current + 1)
+            self.items[current], self.items[current + 1] = self.items[current + 1], self.items[current]
 
     def clear_with_confirm(self):
-        if self.list_widget.count() > 0:
-            if QMessageBox.question(self, "Confirm Clear", "Are you sure you want to clear the list?",
-                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                    QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-                self.list_widget.clear()
+        if self.list_widget.count() < 0:
+            return
+        if QMessageBox.question(self, "Confirm Clear", "Are you sure you want to clear the list?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self.list_widget.clear()
+            self.items.clear()
 
     def done(self):
         if self.list_widget.count() == 0:
@@ -322,6 +343,14 @@ class MainList(QWidget):
                                 QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
             return
 
+        for (image, text) in self.items:
+            if text == "???":
+                QMessageBox.warning(self, "Warning", "Not all items have text")
+                return
+
+        print("Starting...")
+        threading.Thread(target=process_items, args=(self.items,)).start()
+
 
 class ApiKeysWindow(QDialog):
     class ApiLayout(QVBoxLayout):
@@ -336,8 +365,6 @@ class ApiKeysWindow(QDialog):
             self.addWidget(self.label)
 
             self.keys = api.get_all_keys()
-            self.keys.sort(key=lambda x: x.quota_used / x.quota_total)
-            self.keys.reverse()
 
             self.list = QListWidget()
             self.addWidget(self.list)
@@ -374,10 +401,10 @@ class ApiKeysWindow(QDialog):
         self.apis_layout = QHBoxLayout()
         self.layout.addLayout(self.apis_layout)
 
-        self.deepl_layout = ApiKeysWindow.ApiLayout("DeepL", deepl_api, DEEPL_QUOTA)
+        self.deepl_layout = ApiKeysWindow.ApiLayout("DeepL", deepl_keychain, DEEPL_QUOTA)
         self.apis_layout.addLayout(self.deepl_layout)
 
-        self.elevenlabs_layout = ApiKeysWindow.ApiLayout("ElevenLabs", elevenlabs_api, ELEVENLABS_QUOTA)
+        self.elevenlabs_layout = ApiKeysWindow.ApiLayout("ElevenLabs", elevenlabs_keychain, ELEVENLABS_QUOTA)
         self.apis_layout.addLayout(self.elevenlabs_layout)
 
         self.ok_button = QPushButton("Done")
@@ -399,15 +426,16 @@ class SettingsWidget(QWidget):
 
         self.source_langs = [lang.name for lang in translator.get_source_languages()]
         self.source_langs.sort()
-        self.source_langs.insert(0, "???")
 
         self.source_combo = QComboBox()
-        self.source_combo.currentTextChanged.connect(self.update_source)
         self.source_combo.addItems(self.source_langs)
-        self.layout.addWidget(self.source_combo)
-
         if source_language in self.source_langs:
             self.source_combo.setCurrentText(source_language)
+        else:
+            self.source_combo.addItem("???")
+            self.source_combo.setCurrentText("???")
+        self.source_combo.currentTextChanged.connect(self.update_source)
+        self.layout.addWidget(self.source_combo)
 
         self.target_label = QLabel("Target languages:")
         self.layout.addWidget(self.target_label)
@@ -441,8 +469,11 @@ class SettingsWidget(QWidget):
         self.voice_label = QLabel("Voice:")
         self.layout.addWidget(self.voice_label)
 
+        voices = get_voices()
         self.voice_combo = QComboBox()
-        self.voice_combo.addItems(get_voices())
+        self.voice_combo.addItems(voices)
+        if voice in voices:
+            self.voice_combo.setCurrentText(voice)
         self.voice_combo.currentTextChanged.connect(self.update_voice)
         self.layout.addWidget(self.voice_combo)
 
@@ -509,6 +540,8 @@ class SettingsWidget(QWidget):
         global source_language
         source_language = self.source_combo.currentText()
         set_setting("source_language", source_language)
+        if source_language != "???":
+            self.source_combo.removeItem(self.source_combo.findText("???"))
 
     def update_fps(self, value):
         global fps
@@ -563,7 +596,7 @@ class StreamRedirector:
         self.text_widget = text_widget
 
     def write(self, text):
-        self.text_widget.append(text)
+        self.text_widget.insertPlainText(text)
 
     def flush(self):
         pass
@@ -610,7 +643,6 @@ class SracreWindow(QMainWindow):
         sys.stdout = StreamRedirector(self.output_textedit)
 
         print("Welcome to sracre! Waiting for work...")
-
         self.show()
 
     def closeEvent(self, event):
@@ -637,7 +669,7 @@ class SracreApp(QApplication):
             os.makedirs(directory, exist_ok=True)
 
         setup_db()
-        elevenlabs.set_api_key(elevenlabs_api.get_key(0).key)
+        elevenlabs.set_api_key(elevenlabs_keychain.get_key(0).key)
 
         settings = get_settings()
         global source_language, selected_languages, fps, scale, voice, video_length, fade_duration, audio_padding
