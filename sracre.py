@@ -63,7 +63,7 @@ class Keychain:
 
 ICON_SIZE = 128
 IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.webp')
-OUT_DIRS = ["output/audio", "output/videos", "output/clips"]
+OUT_DIRS = ["output/audio", "output/videos", "output/clips", "output/done"]
 DEEPL_QUOTA = 500000
 ELEVENLABS_QUOTA = 20000
 
@@ -80,6 +80,7 @@ elevenlabs_keychain = Keychain("elevenlabs")
 translator: Optional[deepl.Translator] = None
 selected_languages = []
 source_language = "???"
+target_texts = {}
 
 db = sqlite3.connect("sracre.db")
 
@@ -202,7 +203,7 @@ def concatenate_clips(clips):
     video_filters = []
     audio_filters = []
     clips_hash = get_hash([os.path.splitext(os.path.basename(clip))[0] for clip in clips])
-    output_path = f"output/{clips_hash}.mp4"
+    output_path = f"output/done/{clips_hash}.mp4"
     if os.path.exists(output_path):
         print(f"Concatenated clip for \"{output_path}\" already exists. Remove it to regenerate.")
         return output_path
@@ -237,31 +238,137 @@ def get_voices():
     return sorted([v.name for v in voices])
 
 
-def process_items(items):
-    clips = []
-    for (image, text) in items:
-        clips.append(create_clip(text, image))
-    concatenate_clips(clips)
+class TranslationThread(QThread):
+    translation_done = pyqtSignal(str)
+    has_error = pyqtSignal(Exception)
 
-
-class WorkerThread(QThread):
-    show_generic_error = pyqtSignal()
-    show_key_error = pyqtSignal()
-
-    def __init__(self, items):
+    def __init__(self, text, targets):
         super().__init__()
-        self.items = items
+        self.text = text
+        self.targets = targets
         self.error = None
 
     def run(self):
         try:
-            process_items(self.items)
-        except Keychain.Error as e:
-            self.error = e
-            self.show_key_error.emit()
+            db_ = sqlite3.connect("sracre.db")
+
+            text_len = sum([len(line) for line in self.text]) * len(self.targets)
+            key = deepl_keychain.get_key(db_, text_len)
+            translator_ = deepl.Translator(key.key)
+
+            target_langs = {lang.name: lang for lang in translator_.get_target_languages()}
+            source_lang = {lang.name: lang for lang in translator_.get_source_languages()}[source_language]
+
+            global target_texts
+            for target in self.targets:
+                print(f"Translating to \"{target}\" from \"{source_language}\"")
+                translation = translator_.translate_text(self.text, source_lang=source_lang,
+                                                         target_lang=target_langs[target])
+                target_texts[target] = [line.text for line in translation]
+                self.translation_done.emit(target)
+
+            usage = translator_.get_usage()
+            quota_curr = int(usage.character.count)
+            quota_total = int(usage.character.limit)
+            print(f"{quota_curr} == {key.quota_used+text_len}")
+            deepl_keychain.update_quota(db_, key.key, quota_curr, quota_total, 0)
         except Exception as e:
-            self.error = e
-            self.show_generic_error.emit()
+            self.has_error.emit(e)
+
+
+class TranslationWindow(QDialog):
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self.setWindowTitle("Translation")
+        self.resize(800, 600)
+
+        self.layout = QVBoxLayout(self)
+        self.setLayout(self.layout)
+
+        self.texts_layout = QHBoxLayout()
+        self.layout.addLayout(self.texts_layout)
+
+        self.source_layout = QVBoxLayout()
+        self.texts_layout.addLayout(self.source_layout)
+
+        self.source_combo = QComboBox()
+        self.source_combo.addItem(source_language)
+        self.source_combo.setDisabled(True)
+        self.source_layout.addWidget(self.source_combo)
+
+        self.source_text_edit = QTextEdit()
+        self.source_text_edit.setReadOnly(True)
+        self.source_text_edit.setText("\n\n".join(text))
+        self.source_layout.addWidget(self.source_text_edit)
+
+        self.target_layout = QVBoxLayout()
+        self.texts_layout.addLayout(self.target_layout)
+
+        self.target_combo = QComboBox()
+        self.target_combo.addItems(selected_languages)
+        self.target_combo.currentTextChanged.connect(self.change_viewed_target)
+        self.target_layout.addWidget(self.target_combo)
+
+        self.target_text_edit = QTextEdit()
+        self.target_text_edit.setReadOnly(True)
+        self.target_layout.addWidget(self.target_text_edit)
+
+        self.buttons_layout = QHBoxLayout()
+        self.layout.addLayout(self.buttons_layout)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        self.cancel_button.setDefault(True)
+        self.buttons_layout.addWidget(self.cancel_button)
+
+        self.ok_button = QPushButton("OK")
+        self.ok_button.clicked.connect(self.accept)
+        self.buttons_layout.addWidget(self.ok_button)
+
+        if len(target_texts) == 0 and len(selected_languages) > 0:
+            self.worker = TranslationThread(self.text, selected_languages)
+            self.worker.translation_done.connect(self.on_translation_done)
+            self.worker.has_error.connect(self.on_translation_error)
+            self.worker.start()
+        else:
+            print("Translation already done")
+
+    def change_viewed_target(self):
+        target = self.target_combo.currentText()
+        self.target_text_edit.setText("\n\n".join(target_texts[target]) if target in target_texts else "???")
+
+    def on_translation_done(self, target):
+        if self.target_combo.currentText() != target:
+            return
+        self.change_viewed_target()
+
+    def on_translation_error(self, error):
+        QMessageBox.critical(self, "Error", str(error))
+
+
+class WorkerThread(QThread):
+    has_error = pyqtSignal(Exception)
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = items
+
+    def run(self):
+        try:
+            texts = target_texts
+            texts[source_language] = [text for (_, text) in self.items]
+            images = [image for (image, _) in self.items]
+
+            for (lang, text) in texts.items():
+                print(f"\n----\nCreating clips for \"{lang}\"")
+                clips = []
+                for (line, image) in zip(text, images):
+                    clips.append(create_clip(line, image))
+                concatenate_clips(clips)
+            print("\n----\nDone!")
+        except Exception as e:
+            self.has_error.emit(e)
 
 
 class ListWidget(QListWidget):
@@ -348,7 +455,7 @@ class EditorWidget(QWidget):
         item = QListWidgetItem(icon, self.get_next_text())
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
         self.list_widget.addItem(item)
-        self.items.append((path, "???"))
+        self.items.append((path, item.text()))
 
     def on_image_double_clicked(self, item):
         row = self.list_widget.row(item)
@@ -434,17 +541,17 @@ class EditorWidget(QWidget):
                 QMessageBox.warning(self, "Warning", "Not all items have text")
                 return
 
+        ex = TranslationWindow([text for (_, text) in self.items])
+        if ex.exec() != QDialog.DialogCode.Accepted:
+            return
+
         print("Starting...")
         self.worker = WorkerThread(self.items)
-        self.worker.show_generic_error.connect(self.show_generic_error_dialog)
-        self.worker.show_key_error.connect(self.show_key_error_dialog)
+        self.worker.has_error.connect(self.show_error_dialog)
         self.worker.start()
 
-    def show_generic_error_dialog(self):
-        QMessageBox.critical(self, "Error", str(self.worker.error))
-
-    def show_key_error_dialog(self):
-        QMessageBox.critical(self, "Error", "No keys available, check available quota")
+    def show_error_dialog(self, error):
+        QMessageBox.critical(self, "Error", str(error))
 
 
 class ApiKeysWindow(QDialog):
