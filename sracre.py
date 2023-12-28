@@ -47,7 +47,7 @@ class Keychain:
         db_.commit()
 
     def update_quota(self, db_, key, current, total, reset_time):
-        print(f"Updating quota for {key} to {current}/{total} with reset time {reset_time}")
+        print(f"Updating quota for {key} ({self.api_name}) to {current}/{total} with reset time {reset_time}")
         db_.cursor().execute("UPDATE keys SET quota_used = ?, quota_total = ?, reset_time = ? WHERE api = ? AND key = ?"
                              , (current, total, reset_time, self.api_name, key))
         db_.commit()
@@ -65,7 +65,7 @@ ICON_SIZE = 128
 IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.webp')
 OUT_DIRS = ["output/audio", "output/videos", "output/clips", "output/done"]
 DEEPL_QUOTA = 500000
-ELEVENLABS_QUOTA = 20000
+ELEVENLABS_QUOTA = 40000
 
 fps = 30
 scale = 1.5
@@ -199,11 +199,10 @@ def merge_audio_video(audio_path, video_path):
     return output_path
 
 
-def concatenate_clips(clips):
+def concatenate_clips(clips, filename):
     video_filters = []
     audio_filters = []
-    clips_hash = get_hash([os.path.splitext(os.path.basename(clip))[0] for clip in clips])
-    output_path = f"output/done/{clips_hash}.mp4"
+    output_path = f"output/done/{filename}.mp4"
     if os.path.exists(output_path):
         print(f"Concatenated clip for \"{output_path}\" already exists. Remove it to regenerate.")
         return output_path
@@ -270,7 +269,6 @@ class TranslationThread(QThread):
             usage = translator_.get_usage()
             quota_curr = int(usage.character.count)
             quota_total = int(usage.character.limit)
-            print(f"{quota_curr} == {key.quota_used+text_len}")
             deepl_keychain.update_quota(db_, key.key, quota_curr, quota_total, 0)
         except Exception as e:
             self.has_error.emit(e)
@@ -365,7 +363,9 @@ class WorkerThread(QThread):
                 clips = []
                 for (line, image) in zip(text, images):
                     clips.append(create_clip(line, image))
-                concatenate_clips(clips)
+                lang_name = lang.split(" ")[0].lower()
+                filename = f"{lang_name}_{get_hash(texts[source_language])}"
+                concatenate_clips(clips, filename)
             print("\n----\nDone!")
         except Exception as e:
             self.has_error.emit(e)
@@ -679,7 +679,7 @@ class SettingsWidget(QWidget):
         self.voice_combo.currentTextChanged.connect(self.update_voice)
         self.layout.addWidget(self.voice_combo)
 
-        self.scale_label = QLabel(f"Final scale ({scale}):")
+        self.scale_label = QLabel(f"Animation strength ({scale}):")
         self.layout.addWidget(self.scale_label)
 
         self.scale_slider = QSlider(Qt.Orientation.Horizontal)
