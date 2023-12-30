@@ -387,7 +387,7 @@ class WorkerThread(QThread):
             images = [image for (image, _) in self.items]
 
             progress = 0
-            progress_step = 100 / len(texts)
+            progress_step = 95 / len(texts)
             for (lang, text) in texts.items():
                 print(f"\n----\nCreating clips for \"{lang}\"")
                 clips = []
@@ -579,7 +579,6 @@ class EditorWidget(QWidget):
                 QMessageBox.warning(self, "Warning", "Not all items have text")
                 return
 
-        print(selected_languages)
         if len(selected_languages) > 0:
             ex = TranslationWindow([text for (_, text) in self.items])
             if ex.exec() != QDialog.DialogCode.Accepted:

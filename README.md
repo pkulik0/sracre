@@ -19,7 +19,7 @@ Sracre is a powerful and innovative tool designed to streamline the creation of 
 ### Usage
 
    ```sh
-   git clone https://github.com/yourusername/sracre.git
+   git clone https://github.com/pkulik0/sracre.git
    cd sracre
    pip install -r requirements.txt
    python sracre.py
