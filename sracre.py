@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QListWidget,
                              QListWidgetItem, QVBoxLayout, QCheckBox,
                              QComboBox, QLabel, QScrollArea, QGroupBox,
                              QMessageBox, QSlider, QLineEdit, QDialog,
-                             QTextEdit, QFileDialog)
+                             QTextEdit, QFileDialog, QProgressBar)
 from PyQt6.QtCore import QSize, Qt, pyqtSignal, QPoint, QThread
 from PyQt6.QtGui import QIcon, QPixmap, QDragEnterEvent, QDropEvent, QMouseEvent, QTextCursor
 import random
@@ -153,17 +153,17 @@ def generate_video(image):
     zoom_increment = (scale - 1) / total_frames
     pan_directions = get_next_pan_directions()
     zoompan_filter = (
-        f"scale=8000:-1,zoompan="
-        f"z='min(zoom+{zoom_increment:.10f},{scale})'"
+        "scale=8000:-1,"
+        f"zoompan=z='min(zoom+{zoom_increment:.10f},{scale})'"
         f":x='(x+{pan_directions[0]})/a*on'"
         f":y='(y+{pan_directions[1]})*on'"
         f":d={total_frames}"
-        f":s=1920x1080"
+        ":s=1920x1080"
     )
     print(f"Generating clip from \"{image}\" with end scale {scale} and duration {video_length}")
     (
-        ffmpeg.input(image, loop=1, framerate=fps)
-        .output(output_path, vcodec='libx264', t=video_length, vf=zoompan_filter, pix_fmt='yuv420p')
+        ffmpeg.input(image)
+        .output(output_path, vcodec='hevc_videotoolbox', t=video_length, vf=zoompan_filter, pix_fmt='yuv420p', r=fps, video_bitrate='8000k')
         .run(quiet=True)
     )
     print("Saved clip to:", output_path)
@@ -210,7 +210,7 @@ def concatenate_clips(clips, filename):
     for clip in clips:
         clip_input = ffmpeg.input(clip)
 
-        video = clip_input.video.filter('setpts', 'PTS-STARTPTS')
+        video = clip_input.video.filter('setpts', 'PTS-STARTPTS').filter('setsar', 1)
         video = video.filter('fade', type='in', start_time=0, duration=fade_duration)
         video = video.filter('fade', type='out', start_time=video_length - fade_duration, duration=fade_duration)
         video_filters.append(video)
@@ -237,6 +237,17 @@ def get_voices():
     return sorted([v.name for v in voices])
 
 
+def show_api_keys():
+    api_keys_window = ApiKeysWindow()
+    api_keys_window.exec()
+
+
+def set_keys():
+    global translator
+    translator = deepl.Translator(deepl_keychain.get_key(db, 0).key)
+    elevenlabs.set_api_key(elevenlabs_keychain.get_key(db, 0).key)
+
+
 class TranslationThread(QThread):
     translation_done = pyqtSignal(str)
     has_error = pyqtSignal(Exception)
@@ -258,13 +269,31 @@ class TranslationThread(QThread):
             target_langs = {lang.name: lang for lang in translator_.get_target_languages()}
             source_lang = {lang.name: lang for lang in translator_.get_source_languages()}[source_language]
 
+            cursor = db_.cursor()
             global target_texts
             for target in self.targets:
+                lines = []
+                from_db_count = 0
                 print(f"Translating to \"{target}\" from \"{source_language}\"")
-                translation = translator_.translate_text(self.text, source_lang=source_lang,
-                                                         target_lang=target_langs[target])
-                target_texts[target] = [line.text for line in translation]
+                for line in self.text:
+                    line_hash = get_hash(line)
+                    try:
+                        result = cursor.execute("SELECT target_text FROM translations WHERE text_hash = ? AND "
+                                                "target_lang = ?", (line_hash, target)).fetchone()
+                        lines.append(result[0])
+                        from_db_count += 1
+                        continue
+                    except TypeError:
+                        pass
+
+                    translation = translator_.translate_text(line, source_lang=source_lang,
+                                                             target_lang=target_langs[target])
+                    lines.append(translation.text)
+                    cursor.execute("INSERT INTO translations (text_hash, target_lang, target_text) VALUES (?, ?, ?)", (line_hash, target, translation.text))
+                target_texts[target] = lines
+                print(f"Translated {len(lines)} lines (used {from_db_count} from db)")
                 self.translation_done.emit(target)
+            db_.commit()
 
             usage = translator_.get_usage()
             quota_curr = int(usage.character.count)
@@ -305,7 +334,7 @@ class TranslationWindow(QDialog):
 
         self.target_combo = QComboBox()
         self.target_combo.addItems(selected_languages)
-        self.target_combo.currentTextChanged.connect(self.change_viewed_target)
+        self.target_combo.currentTextChanged.connect(self.refresh_viewed_target)
         self.target_layout.addWidget(self.target_combo)
 
         self.target_text_edit = QTextEdit()
@@ -324,22 +353,20 @@ class TranslationWindow(QDialog):
         self.ok_button.clicked.connect(self.accept)
         self.buttons_layout.addWidget(self.ok_button)
 
-        if len(target_texts) == 0 and len(selected_languages) > 0:
+        if len(selected_languages) > 0:
             self.worker = TranslationThread(self.text, selected_languages)
             self.worker.translation_done.connect(self.on_translation_done)
             self.worker.has_error.connect(self.on_translation_error)
             self.worker.start()
-        else:
-            print("Translation already done")
 
-    def change_viewed_target(self):
+    def refresh_viewed_target(self):
         target = self.target_combo.currentText()
-        self.target_text_edit.setText("\n\n".join(target_texts[target]) if target in target_texts else "???")
+        self.target_text_edit.setText("\n\n".join(target_texts[target]) if target in target_texts else "")
 
     def on_translation_done(self, target):
         if self.target_combo.currentText() != target:
             return
-        self.change_viewed_target()
+        self.refresh_viewed_target()
 
     def on_translation_error(self, error):
         QMessageBox.critical(self, "Error", str(error))
@@ -347,6 +374,7 @@ class TranslationWindow(QDialog):
 
 class WorkerThread(QThread):
     has_error = pyqtSignal(Exception)
+    progress = pyqtSignal(int)
 
     def __init__(self, items):
         super().__init__()
@@ -358,15 +386,21 @@ class WorkerThread(QThread):
             texts[source_language] = [text for (_, text) in self.items]
             images = [image for (image, _) in self.items]
 
+            progress = 0
+            progress_step = 100 / len(texts)
             for (lang, text) in texts.items():
                 print(f"\n----\nCreating clips for \"{lang}\"")
                 clips = []
                 for (line, image) in zip(text, images):
+                    progress_sub_step = progress_step / len(text)
+                    progress += progress_sub_step
+                    self.progress.emit(int(progress))
                     clips.append(create_clip(line, image))
                 lang_name = lang.split(" ")[0].lower()
                 filename = f"{lang_name}_{get_hash(texts[source_language])}"
                 concatenate_clips(clips, filename)
             print("\n----\nDone!")
+            self.progress.emit(100)
         except Exception as e:
             self.has_error.emit(e)
 
@@ -432,10 +466,15 @@ class EditorWidget(QWidget):
         self.clear_button.clicked.connect(self.clear_with_confirm)
         self.buttons_layout.addWidget(self.clear_button)
 
-        self.done_button = QPushButton("Done")
-        self.done_button.clicked.connect(self.done)
+        self.done_button = QPushButton("Start")
+        self.done_button.clicked.connect(self.start_worker)
         self.done_button.setDefault(True)
         self.buttons_layout.addWidget(self.done_button, 1)
+
+        self.output_progress = QProgressBar()
+        self.output_progress.setRange(0, 100)
+        self.output_progress.setValue(0)
+        self.layout.addWidget(self.output_progress)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -466,14 +505,16 @@ class EditorWidget(QWidget):
             self.list_widget.item(row).setIcon(QIcon(QPixmap(new_image_path)))
 
     def get_next_text(self):
-        return self.text_list.pop() if self.text_list else "???"
+        return self.text_list.pop(0) if self.text_list else "???"
 
     def load_text(self, path):
         self.text_list.clear()
-        with open(path, 'r') as file:
-            self.text_list.extend(line.strip() for line in file if line.strip())
-            self.text_list.reverse()
-            self.update_text()
+        try:
+            with open(path, 'r') as file:
+                self.text_list.extend(line.strip() for line in file if line.strip())
+                self.update_text()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
     def update_text(self):
         filled_up_to = min(self.list_widget.count(), len(self.text_list))
@@ -518,12 +559,9 @@ class EditorWidget(QWidget):
             self.list_widget.clear()
             self.items.clear()
 
-    def done(self):
+    def start_worker(self):
         if self.list_widget.count() == 0:
             QMessageBox.warning(self, "Warning", "The list is empty")
-            return
-        if not selected_languages:
-            QMessageBox.warning(self, "Warning", "No target languages selected")
             return
         if source_language == "???":
             QMessageBox.warning(self, "Warning", "No source language selected")
@@ -541,13 +579,16 @@ class EditorWidget(QWidget):
                 QMessageBox.warning(self, "Warning", "Not all items have text")
                 return
 
-        ex = TranslationWindow([text for (_, text) in self.items])
-        if ex.exec() != QDialog.DialogCode.Accepted:
-            return
+        print(selected_languages)
+        if len(selected_languages) > 0:
+            ex = TranslationWindow([text for (_, text) in self.items])
+            if ex.exec() != QDialog.DialogCode.Accepted:
+                return
 
         print("Starting...")
         self.worker = WorkerThread(self.items)
         self.worker.has_error.connect(self.show_error_dialog)
+        self.worker.progress.connect(self.output_progress.setValue)
         self.worker.start()
 
     def show_error_dialog(self, error):
@@ -728,14 +769,16 @@ class SettingsWidget(QWidget):
         self.layout.addWidget(self.audio_padding_slider)
 
         self.api_keys_button = QPushButton("Edit API Keys")
-        self.api_keys_button.clicked.connect(self.show_api_keys)
+        self.api_keys_button.clicked.connect(show_api_keys)
         self.layout.addWidget(self.api_keys_button)
 
     def update_targets(self):
         selected_languages.clear()
         for checkbox in self.checkboxes:
             if checkbox.isChecked():
-                selected_languages.append(checkbox.text())
+                text = checkbox.text()
+                if text.strip():
+                    selected_languages.append(text)
         set_setting("selected_languages", ",".join(selected_languages))
 
     def update_source(self):
@@ -756,7 +799,7 @@ class SettingsWidget(QWidget):
 
         global scale
         scale = rounded_value / 100
-        self.scale_label.setText(f"Final scale ({scale}):")
+        self.scale_label.setText(f"Animation strength ({scale}):")
         set_setting("scale", scale)
 
     def update_voice(self, value):
@@ -835,19 +878,6 @@ class SracreWindow(QMainWindow):
         self.languages_widget = SettingsWidget()
         self.language_group_layout.addWidget(self.languages_widget)
 
-        self.output_group = QGroupBox("Output")
-        self.output_group_layout = QVBoxLayout()
-        self.output_group.setLayout(self.output_group_layout)
-        self.layout.addWidget(self.output_group, 1)
-
-        self.output_textedit = QTextEdit()
-        self.output_textedit.setReadOnly(True)
-        self.output_group_layout.addWidget(self.output_textedit)
-
-        out_redirector = StreamRedirector(self.output_textedit)
-        sys.stdout = out_redirector
-        sys.stderr = out_redirector
-
         print("Welcome to sracre! Waiting for work...")
         self.show()
 
@@ -871,17 +901,25 @@ class SracreApp(QApplication):
         cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         cursor.execute("CREATE TABLE IF NOT EXISTS keys (api TEXT, key TEXT, quota_used INTEGER, "
                        "quota_total INTEGER, reset_time INTEGER)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS translations (text_hash TEXT, target_lang TEXT, target_text "
+                       "TEXT, PRIMARY KEY (text_hash, target_lang))")
         db.commit()
-        global translator
-        translator = deepl.Translator(deepl_keychain.get_key(db, 0).key)
-        elevenlabs.set_api_key(elevenlabs_keychain.get_key(db, 0).key)
-        settings = get_settings()
 
+        while True:
+            try:
+                set_keys()
+                break
+            except Keychain.Error:
+                show_api_keys()
+
+        settings = get_settings()
         global source_language, selected_languages, fps, scale, voice, video_length, fade_duration, audio_padding
         if "source_language" in settings:
             source_language = settings["source_language"]
         if "selected_languages" in settings:
-            selected_languages = settings["selected_languages"].split(",")
+            languages = settings["selected_languages"].split(",")
+            if languages != [""]:
+                selected_languages = languages
         if "fps" in settings:
             fps = settings["fps"]
         if "scale" in settings:

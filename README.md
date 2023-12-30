@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sracre is a powerful and innovative tool designed to streamline the creation of localized video content. By harnessing the power of automated translation and voice synthesis, it allows users to transform text and images into engaging videos, each tailored to a specific language audience. Whether for educational, marketing, or entertainment purposes, Sracre makes it easy to connect with a global audience.
+Sracre is a powerful and innovative tool designed to streamline the creation of localized video content. By harnessing the power of automated translation and AI voice synthesis, it allows users to transform text and images into engaging videos, each tailored to a specific language audience. Whether for educational, marketing, or entertainment purposes, Sracre makes it easy to connect with a global audience.
 
 ## Features
 
@@ -15,15 +15,6 @@ Sracre is a powerful and innovative tool designed to streamline the creation of 
 ![Screenshot0](readme/0.png)
 
 ## Getting Started
-
-### Prerequisites
-
-Before you start using Sracre, ensure you have the following installed:
-
-- Python 3.6 or later
-- PyQt6
-- SQLite3
-- FFmpeg
 
 ### Usage
 
@@ -39,14 +30,14 @@ Before you start using Sracre, ensure you have the following installed:
 To use the translation and voice synthesis features, you'll need to obtain and configure API keys from the respective service providers.
 
 1. **DeepL for Translation:**
-   - Sign up and obtain an API key from [DeepL](https://www.deepl.com/pro#developer).
+   - Sign up and obtain an API key from [DeepL](https://www.deepl.com/).
    - Enter the API key in the provided dialog in the application settings.
 
 2. **ElevenLabs for Voice Synthesis:**
    - Get your API key from [ElevenLabs](https://www.elevenlabs.com/).
    - Input the API key into the application through the API Key management section.
 
-## Usage
+## Workflow
 
 1. **Prepare Your Content:**
    - Load text files and images you wish to use in your videos.
